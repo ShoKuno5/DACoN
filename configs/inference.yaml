@@ -14,6 +14,11 @@ datasets:
 network:
   feats_dim: 128
 
+  feature_backbone:
+    type: dinov2
+    model_type: dinov2_vitl14
+    input_size: [518, 518]
+
   dino_model_type: dinov2_vitl14
   dino_input_size: [518, 518]
 
@@ -26,4 +31,3 @@ network:
 val:
   save_images: True
   save_json: False
-

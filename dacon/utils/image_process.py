@@ -5,7 +5,13 @@ import torch
 import torch.nn.functional as F
 from torchvision.io import read_image
 from skimage import measure
-from skimage.morphology import footprint_rectangle, binary_dilation
+try:
+    from skimage.morphology import footprint_rectangle, binary_dilation
+except ImportError:  # scikit-image >=0.22 renamed footprint helpers
+    from skimage.morphology import rectangle, binary_dilation  # type: ignore
+
+    def footprint_rectangle(shape):
+        return rectangle(shape[0], shape[1])
 
 def get_image(image_path):
     

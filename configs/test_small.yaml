@@ -1,5 +1,4 @@
-
-name: dacon_test
+name: dacon_test_small
 model_type: DACoN
 
 num_gpu: 1 
@@ -9,19 +8,15 @@ version: "1_1" # "1_0"
 colorize_type: keyframe # keyframe, consecutive_frame
 ref_shot: 1 # 1, 5, max (for keyframe colorization)
 
-
 datasets:
   name: PaintBucket_Char_v2
   clip_interval: 20 # max (for PaintBucket_Real) 
 
   val:
-    root: dataset/PaintBucket_Char_v2/test/PaintBucket_Char_v2/
-    # root: dataset/PaintBucket_Char_v2/test/PaintBucket_Real/
+    root: /workspace/DACoN/dacon/dataset/PaintBucket_Char_v2/test_small/PaintBucket_Char_v2/
     save_path: outputs/
-    num_worker: 4
+    num_worker: 2
     
-    
-
 network:
   feats_dim: 128
 
@@ -38,17 +33,24 @@ network:
   unet_hidden_dim_list: [64, 128, 256, 512]
 
   segment_pool_size: [512, 512]
+  
+  dift:
+    enabled: true
+    img_size: [768, 768]
+    t: 261
+    up_ft_index: 1
+    ensemble_size: 4
+    prompt: ""
+    device: cuda
+    cache_dir: /workspace/DACoN/dacon/outputs/dift_cache
 
 val:
   save_images: True
   save_json: True
-  save_path: outputs/
+  save_path: outputs/test_small/dift_only/
 
   batch_size: 1
 
 losses:
   loss_scale_ce: 0.5
   loss_scale_mae: 0.2
-
-
-

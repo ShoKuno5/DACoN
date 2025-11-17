@@ -1,0 +1,53 @@
+
+name: dacon_test_sddino
+model_type: DACoN
+
+num_gpu: 1 
+manual_seed: 42
+
+version: "1_1"
+colorize_type: keyframe
+ref_shot: 1
+
+datasets:
+  name: PaintBucket_Char_v2
+  clip_interval: 20
+
+  val:
+    root: dataset/PaintBucket_Char_v2/test_small/PaintBucket_Char_v2/
+    save_path: outputs/
+    num_worker: 4
+
+network:
+  feats_dim: 128
+  feature_backbone_only: true
+
+  feature_backbone:
+    type: sd-dino
+    repo_path: ../sd-dino
+    device: cuda
+    sd_diffusion_ver: v1-5
+    sd_image_size: 960
+    sd_num_timesteps: 50
+    sd_block_indices: [2, 5, 8, 11]
+    sd_decoder_only: true
+    sd_encoder_only: false
+    sd_resblock_only: false
+    combine_s4_s5: true
+    normalize: true
+
+  segment_pool_size: [512, 512]
+  
+  dift:
+    enabled: false
+
+val:
+  save_images: True
+  save_json: True
+  save_path: outputs/sd_dino/
+
+  batch_size: 1
+
+losses:
+  loss_scale_ce: 0.5
+  loss_scale_mae: 0.2

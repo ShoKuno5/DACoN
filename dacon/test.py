@@ -27,7 +27,7 @@ from utils import (
 
 
 
-def validate(model, val_dataloader, criterion, device, save_images, save_json, save_path):
+def validate(model, val_dataloader, criterion, device, save_images, save_json, save_path, use_dift_only=False):
     model.eval()
 
     total_loss = 0.0
@@ -45,10 +45,17 @@ def validate(model, val_dataloader, criterion, device, save_images, save_json, s
         for i, data in enumerate(val_dataloader):
             data = move_data_to_device(data, device)
 
-            seg_sim_map, dino_seg_sim_map = model.forward(data)
-            loss, _, _ = criterion(data, seg_sim_map, dino_seg_sim_map)
-            loss = loss.item()
-     
+            if use_dift_only:
+                if not model.use_dift:
+                    raise RuntimeError("DIFT-only test requested but DIFT is disabled in the model configuration.")
+                seg_sim_map = model.compute_dift_similarity(data)
+                dino_seg_sim_map = None
+                loss = 0.0
+            else:
+                seg_sim_map, dino_seg_sim_map = model.forward(data)
+                loss, _, _ = criterion(data, seg_sim_map, dino_seg_sim_map)
+                loss = loss.item()
+
             metrics  = calculate_metrics(seg_sim_map, data, save_images, save_json, save_path)
             total_loss += loss
             total_seg_acc += metrics["total_seg_acc"]
@@ -82,7 +89,7 @@ def validate(model, val_dataloader, criterion, device, save_images, save_json, s
 
     return val_results
 
-def validate_multi_ref(model, config, device, save_images, save_json, save_path):
+def validate_multi_ref(model, config, device, save_images, save_json, save_path, use_dift_only=False):
     model.eval()
 
     total_loss = 0.0
@@ -114,17 +121,21 @@ def validate_multi_ref(model, config, device, save_images, save_json, save_path)
             ref_dataset = DACoNSingleDataset(ref_data_list, val_data_root, is_ref=True, mode = "val_kf")
             ref_dataloader = DataLoader(ref_dataset, batch_size=val_batch_size, shuffle=False, num_workers=val_num_workers, collate_fn=dacon_single_pad_collate_fn)
 
-            all_seg_feats_ref = torch.empty(0, device=device)
-            all_seg_colors_ref = torch.empty(0, device=device)
+            all_seg_feats_ref_list = []
+            all_seg_colors_ref_list = []
 
             for i, ref_data in enumerate(ref_dataloader):
                 ref_data = move_data_to_device(ref_data, device)
                 seg_colors_ref = ref_data['seg_colors']
-                seg_feats_ref, _ = model._process_single(ref_data['line_image'], ref_data['seg_image'], ref_data["seg_num"])
+                seg_feats_ref, _, seg_dift_ref = model._process_single(ref_data['line_image'], ref_data['seg_image'], ref_data["seg_num"])
+
+                feats_current = seg_dift_ref if use_dift_only else seg_feats_ref
+                if use_dift_only and feats_current is None:
+                    raise RuntimeError("DIFT features were not computed for reference data. Ensure DIFT is enabled.")
 
                 for b in range(val_batch_size):
-                    all_seg_feats_ref = torch.cat((all_seg_feats_ref, seg_feats_ref[b]), dim = 0)
-                    all_seg_colors_ref = torch.cat((all_seg_colors_ref, seg_colors_ref[b]), dim = 0)
+                    all_seg_feats_ref_list.append(feats_current[b])
+                    all_seg_colors_ref_list.append(seg_colors_ref[b])
                         
                 del ref_data, seg_colors_ref, seg_feats_ref
                 torch.cuda.empty_cache()
@@ -133,13 +144,22 @@ def validate_multi_ref(model, config, device, save_images, save_json, save_path)
             val_dataset = DACoNSingleDataset(val_data_list, val_data_root, is_ref=False, mode = "val_kf")
             val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=val_num_workers, collate_fn=dacon_single_pad_collate_fn)
 
+            if not all_seg_feats_ref_list or not all_seg_colors_ref_list:
+                raise RuntimeError(f"No reference segments found for {char_name} during validation.")
+
+            all_seg_feats_ref = torch.cat(all_seg_feats_ref_list, dim=0)
+            all_seg_colors_ref = torch.cat(all_seg_colors_ref_list, dim=0)
+
             all_seg_feats_ref = all_seg_feats_ref.unsqueeze(0)
             all_seg_feats_ref = all_seg_feats_ref.repeat(val_batch_size, 1, 1)
 
             for i, data in enumerate(val_dataloader):
                 data = move_data_to_device(data, device)
-                seg_feats_tgt, _ = model._process_single(data['line_image'], data['seg_image'], data["seg_num"])
-                seg_sim_map = model.get_seg_cos_sim(all_seg_feats_ref.unsqueeze(1), seg_feats_tgt.unsqueeze(1))
+                seg_feats_tgt, _, seg_dift_tgt = model._process_single(data['line_image'], data['seg_image'], data["seg_num"])
+                feats_tgt_current = seg_dift_tgt if use_dift_only else seg_feats_tgt
+                if use_dift_only and feats_tgt_current is None:
+                    raise RuntimeError("DIFT features were not computed for target data. Ensure DIFT is enabled.")
+                seg_sim_map = model.get_seg_cos_sim(all_seg_feats_ref.unsqueeze(1), feats_tgt_current.unsqueeze(1))
                 seg_sim_map = seg_sim_map.squeeze(1)
 
                 metrics  = calculate_metrics_multi_ref(data, seg_sim_map, all_seg_colors_ref, save_images, save_json, save_path)
@@ -195,6 +215,8 @@ def main(args):
 
     colorize_type = config['colorize_type']
     ref_shot = config['ref_shot']
+    use_dift_only = getattr(args, "use_dift_only", False)
+    feature_backbone_only = getattr(args, "feature_backbone_only", False)
 
     val_data_root = config['datasets']['val']['root']
     num_workers_val = config['datasets']['val']['num_worker']
@@ -214,14 +236,29 @@ def main(args):
         save_path = os.path.join(save_path, "val", colorize_type)
     os.makedirs(save_path, exist_ok=True)
 
+    if feature_backbone_only:
+        config.setdefault('network', {})
+        config['network']['feature_backbone_only'] = (
+            feature_backbone_only or config['network'].get('feature_backbone_only', False)
+        )
+
     logger = setup_logger(save_path, current_time, log_name="dacon_test")
     logger.info(f"Testing DACoN version {version}.")
     logger.info("\n===== Config =====\n" + yaml.dump(config, default_flow_style=False, sort_keys=False))
+    if feature_backbone_only:
+        logger.info("Feature-backbone-only mode enabled (UNet branch disabled).")
+    if use_dift_only and feature_backbone_only:
+        raise RuntimeError("Cannot enable both DIFT-only and feature-backbone-only modes simultaneously.")
+
+    if use_dift_only:
+        logger.info("DIFT-only evaluation enabled.")
 
     device = torch.device("cuda" if torch.cuda.is_available() and config['num_gpu'] > 0 else "cpu")
     logger.info(f"Using device: {device}")
 
     model = DACoNModel(config['network'], version).to(device)
+    if use_dift_only and not model.use_dift:
+        raise RuntimeError("DIFT-only evaluation requested but DIFT is disabled in the configuration.")
     logger.info("\n===== Model Architecture =====\n" + str(model))
 
     logger.info(f"Loading checkpoint {os.path.basename(model_path)}")
@@ -243,14 +280,14 @@ def main(args):
         for char_name in char_names:
             val_data_num += get_file_count(os.path.join(val_data_root, char_name, "gt"))
         logger.info(f"  Evaluating on {val_data_num} samples.")
-        val_results = validate_multi_ref(model, config, device, save_images, save_json, save_path)
+        val_results = validate_multi_ref(model, config, device, save_images, save_json, save_path, use_dift_only=use_dift_only)
 
     elif colorize_type == "consecutive_frame":
         val_data_list = make_val_data_list(val_data_root, colorize_type, clip_interval)
         val_dataset = DACoNDataset(val_data_list, val_data_root, mode = "val_cf")
         val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=num_workers_val, collate_fn=dacon_pad_collate_fn)
         logger.info(f"  Evaluating on {len(val_dataset)} samples.")
-        val_results = validate(model, val_dataloader, criterion, device, save_images, save_json, save_path)
+        val_results = validate(model, val_dataloader, criterion, device, save_images, save_json, save_path, use_dift_only=use_dift_only)
 
     if colorize_type == "keyframe":
         logger.info(f"\n  Evaluation Results for KerFrame Colorization with Ref shot {ref_shot}:")
@@ -285,6 +322,10 @@ if __name__ == "__main__":
     parser.add_argument('--version', type=str,
                         default=None,
                         help='version of DACoN architecture.')
+    parser.add_argument('--use-dift-only', action='store_true',
+                        help='Evaluate using only DIFT segment features.')
+    parser.add_argument('--feature-backbone-only', action='store_true',
+                        help='Bypass the UNet branch and use feature-backbone descriptors directly.')
     args = parser.parse_args()
 
     main(args)

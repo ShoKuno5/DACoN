@@ -1,8 +1,25 @@
+import sys
+from pathlib import Path
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.transforms.functional import to_pil_image
 
 from utils import segment_pooling
+from .feature_backbones import build_feature_backend
+
+try:
+    from dacon.dift_integration import dift_features as dift_backend
+except Exception:  # pragma: no cover - optional dependency
+    try:
+        dacon_root = Path(__file__).resolve().parents[1]
+        if str(dacon_root) not in sys.path:
+            sys.path.append(str(dacon_root))
+        from dacon.dift_integration import dift_features as dift_backend
+    except Exception:
+        dift_backend = None
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -109,33 +126,53 @@ class DACoNModel(nn.Module):
         super(DACoNModel, self).__init__()
 
         self.version = version
-        model_type = dacon_config["dino_model_type"]
+        self.feature_backend = build_feature_backend(dacon_config)
+        self.feature_backbone_only = bool(dacon_config.get("feature_backbone_only", False))
+        self.dino_dim = getattr(self.feature_backend, "output_dim", None)
+        self.feats_dim = dacon_config["feats_dim"]
 
-        try:
-            print(f"Loading DINOv2 model '{model_type}' from PyTorch Hub...")
-            self.dino = torch.hub.load('facebookresearch/dinov2', model_type)
-            print(f"DINOv2 model '{model_type}' loaded successfully.")
-        except Exception as e:
-            raise ImportError(
-                f"Failed to load DINOv2 model '{model_type}' from PyTorch Hub. "
-                f"Please check your internet connection or ensure the model exists. Error: {e}"
-            )
-        for param in self.dino.parameters():
-            param.requires_grad = False
-
-        
-        self.dino_dim = self.dino.embed_dim
-        self.feats_dim = dacon_config["feats_dim"] 
-
-        self.unet_input_size = dacon_config["unet_input_size"] 
-        self.dino_input_size = dacon_config["dino_input_size"] 
-        self.segment_pool_size = dacon_config["segment_pool_size"] 
+        self.unet_input_size = tuple(dacon_config["unet_input_size"])
+        self.segment_pool_size = tuple(dacon_config["segment_pool_size"])
         self.unet_hidden_dim_list = dacon_config["unet_hidden_dim_list"]
 
-        self.unet = UNet(input_dim=3, output_dim=self.feats_dim, hidden_dim_list=self.unet_hidden_dim_list)
-        self.dino_mlp = MLP(self.dino_dim, self.feats_dim*4, self.feats_dim)
-        if self.version == "1_0":
-            self.dino_unet_mlp = MLP(self.feats_dim * 2, self.feats_dim * 4, self.feats_dim)
+        if not self.feature_backbone_only:
+            if self.dino_dim is None:
+                raise ValueError(
+                    "The selected feature backbone must define 'output_dim' unless "
+                    "'feature_backbone_only' is enabled."
+                )
+            self.unet = UNet(
+                input_dim=3, output_dim=self.feats_dim, hidden_dim_list=self.unet_hidden_dim_list
+            )
+            self.dino_mlp = MLP(self.dino_dim, self.feats_dim * 4, self.feats_dim)
+            if self.version == "1_0":
+                self.dino_unet_mlp = MLP(self.feats_dim * 2, self.feats_dim * 4, self.feats_dim)
+            else:
+                self.dino_unet_mlp = None
+        else:
+            self.unet = None
+            self.dino_mlp = None
+            self.dino_unet_mlp = None
+
+        dift_cfg = dacon_config.get("dift", {})
+        self.use_dift = bool(dift_cfg.get("enabled", False))
+        raw_dift_img_size = dift_cfg.get("img_size", (768, 768))
+        if raw_dift_img_size is None:
+            raw_dift_img_size = (768, 768)
+        self.dift_img_size: Tuple[int, int] = tuple(raw_dift_img_size)
+        self.dift_model_id: str = dift_cfg.get("model_id", "stabilityai/stable-diffusion-2-1")
+        self.dift_t: int = int(dift_cfg.get("t", 261))
+        self.dift_up_ft_index: int = int(dift_cfg.get("up_ft_index", 1))
+        self.dift_ensemble_size: int = int(dift_cfg.get("ensemble_size", 8))
+        self.dift_prompt: str = dift_cfg.get("prompt", "")
+        self.dift_cache_dir: Optional[str] = dift_cfg.get("cache_dir")
+        self.dift_device: Optional[str] = dift_cfg.get("device")
+
+        self.latest_dift_feats_map: Optional[torch.Tensor] = None
+        self.latest_seg_dift_feats: Optional[torch.Tensor] = None
+        self.latest_seg_dift_feats_src: Optional[torch.Tensor] = None
+        self.latest_seg_dift_feats_tgt: Optional[torch.Tensor] = None
+        self.latest_dift_sim_map: Optional[torch.Tensor] = None
 
     def l2_normalize(self, x, dim=-1, eps=1e-6):
         return x / (x.norm(p=2, dim=dim, keepdim=True) + eps)
@@ -147,24 +184,64 @@ class DACoNModel(nn.Module):
         return F.interpolate(images, size=target_size, mode='bilinear', align_corners=False)
 
     def get_dino_feats_map(self, images):
-
-        B, S, C, H, W = images.shape
-        images = self._prepare_images(images, self.dino_input_size)
-        dino_output = self.dino.get_intermediate_layers(images, n=1, return_class_token=False)
-        patch_tokens = dino_output[0]
-        feat_H = self.dino_input_size[0] // 14
-        feat_W = self.dino_input_size[1] // 14
-
-        return patch_tokens.permute(0, 2, 1).view(B, S, self.dino_dim, feat_H, feat_W)
+        B, S, _, H, W = images.shape
+        flat = images[:, :, 0:3, :, :].contiguous().view(B * S, 3, H, W)
+        feature_maps = self.feature_backend.extract(flat, target_device=images.device)
+        _, C, feat_h, feat_w = feature_maps.shape
+        return feature_maps.view(B, S, C, feat_h, feat_w)
         
        
     def get_unet_feats_map(self, images):
         B, S, C, H, W = images.shape
+        if self.unet is None:
+            raise RuntimeError("UNet backbone is disabled in feature_backbone_only mode.")
         images = self._prepare_images(images, self.unet_input_size)
         unet_outputs = self.unet(images)
         _, C, H, W = unet_outputs.shape
 
         return unet_outputs.view(B, S, C, H, W)
+
+    def get_dift_feats_map(self, images: torch.Tensor) -> torch.Tensor:
+        if not self.use_dift:
+            raise RuntimeError("DIFT feature extraction is disabled. Set network.dift.enabled=True in config.")
+        if dift_backend is None:
+            raise ImportError(
+                "DIFT backend is not available. Clone the DIFT repo (e.g., DACoN/dift) or set DACON_DIFT_PATH/FGW_DIFT_PATH."
+            )
+
+        B, S, C, H, W = images.shape
+        device = images.device
+        images = self._prepare_images(images, self.dift_img_size)
+
+        dift_maps = []
+        for idx in range(images.shape[0]):
+            img_tensor = images[idx].detach().cpu().clamp(0.0, 1.0)
+            pil_img = to_pil_image(img_tensor)
+            feature_map = dift_backend.extract_dift_features(
+                img=pil_img,
+                img_size=self.dift_img_size,
+                t=self.dift_t,
+                up_ft_index=self.dift_up_ft_index,
+                ensemble_size=self.dift_ensemble_size,
+                prompt=self.dift_prompt,
+                cache_dir=self.dift_cache_dir,
+                device=self.dift_device,
+                model_id=self.dift_model_id,
+            )
+            if not isinstance(feature_map, torch.Tensor):
+                feature_map = torch.from_numpy(feature_map)
+            feature_map = feature_map.to(device)
+            dift_maps.append(feature_map)
+
+        dift_maps_tensor = torch.stack(dift_maps, dim=0)
+        target_h, target_w = self.segment_pool_size
+        if dift_maps_tensor.shape[-2:] != (target_h, target_w):
+            dift_maps_tensor = F.interpolate(
+                dift_maps_tensor, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+
+        dift_maps_tensor = dift_maps_tensor.view(B, S, *dift_maps_tensor.shape[1:])
+        return dift_maps_tensor
 
     def dino_dim_reduction(self, seg_dino_feats):
         B, S, L, C = seg_dino_feats.shape
@@ -216,9 +293,11 @@ class DACoNModel(nn.Module):
         seg_images = seg_image.unsqueeze(1)
         seg_nums = seg_num.unsqueeze(1)
 
-        seg_feats, raw_dino_feats = self._process_multi(line_images, seg_images, seg_nums)
+        seg_feats, raw_dino_feats, seg_dift_feats = self._process_multi(line_images, seg_images, seg_nums)
 
-        return seg_feats.squeeze(1), raw_dino_feats.squeeze(1)
+        if seg_dift_feats is not None:
+            seg_dift_feats = seg_dift_feats.squeeze(1)
+        return seg_feats.squeeze(1), raw_dino_feats.squeeze(1), seg_dift_feats
     
     def _process_multi(self, line_images, seg_images, seg_nums):
 
@@ -226,22 +305,66 @@ class DACoNModel(nn.Module):
         seg_dino_feats = self.get_segment_feats(dino_feats_map, seg_images, seg_nums)
         raw_dino_feats = seg_dino_feats.clone() 
 
-        unet_feats_map = self.get_unet_feats_map(line_images)
-        seg_unet_feats = self.get_segment_feats(unet_feats_map, seg_images, seg_nums)
+        seg_unet_feats = None
+        if not self.feature_backbone_only:
+            unet_feats_map = self.get_unet_feats_map(line_images)
+            seg_unet_feats = self.get_segment_feats(unet_feats_map, seg_images, seg_nums)
 
-        seg_dino_feats_reduced = self.dino_dim_reduction(seg_dino_feats)
-        seg_feats = self.dino_unet_fusion(seg_dino_feats_reduced, seg_unet_feats)
+        seg_dift_feats: Optional[torch.Tensor] = None
+        dift_feats_map: Optional[torch.Tensor] = None
+        if self.use_dift:
+            dift_feats_map = self.get_dift_feats_map(line_images)
+            seg_dift_feats = self.get_segment_feats(dift_feats_map, seg_images, seg_nums)
+            self.latest_dift_feats_map = dift_feats_map.detach()
+            self.latest_seg_dift_feats = seg_dift_feats.detach()
+        else:
+            self.latest_dift_feats_map = None
+            self.latest_seg_dift_feats = None
 
-        return seg_feats, raw_dino_feats
+        if self.feature_backbone_only:
+            seg_feats = self.l2_normalize(seg_dino_feats)
+        else:
+            seg_dino_feats_reduced = self.dino_dim_reduction(seg_dino_feats)
+            seg_feats = self.dino_unet_fusion(seg_dino_feats_reduced, seg_unet_feats)
+
+        return seg_feats, raw_dino_feats, seg_dift_feats
 
     def forward(self, data):
 
-        seg_feats_src, seg_dino_feats_src = self._process_multi(data['line_images_src'], data['seg_images_src'], data["seg_nums_src"])
-        seg_feats_tgt, seg_dino_feats_tgt = self._process_multi(data['line_images_tgt'], data['seg_images_tgt'], data["seg_nums_tgt"])
+        seg_feats_src, seg_dino_feats_src, seg_dift_feats_src = self._process_multi(
+            data['line_images_src'], data['seg_images_src'], data["seg_nums_src"]
+        )
+        seg_feats_tgt, seg_dino_feats_tgt, seg_dift_feats_tgt = self._process_multi(
+            data['line_images_tgt'], data['seg_images_tgt'], data["seg_nums_tgt"]
+        )
+
         dino_seg_cos_sim = self.get_seg_cos_sim(seg_dino_feats_src, seg_dino_feats_tgt)
         seg_cos_sim = self.get_seg_cos_sim(seg_feats_src, seg_feats_tgt)
 
+        dift_seg_cos_sim: Optional[torch.Tensor] = None
+        if self.use_dift and seg_dift_feats_src is not None and seg_dift_feats_tgt is not None:
+            dift_seg_cos_sim = self.get_seg_cos_sim(seg_dift_feats_src, seg_dift_feats_tgt)
+
+        self.latest_seg_dift_feats_src = (
+            seg_dift_feats_src.detach() if seg_dift_feats_src is not None else None
+        )
+        self.latest_seg_dift_feats_tgt = (
+            seg_dift_feats_tgt.detach() if seg_dift_feats_tgt is not None else None
+        )
+        self.latest_dift_sim_map = dift_seg_cos_sim
+
         return seg_cos_sim, dino_seg_cos_sim
+
+    def compute_dift_similarity(self, data) -> torch.Tensor:
+        if not self.use_dift:
+            raise RuntimeError("DIFT feature extraction is disabled. Enable it via network.dift.enabled in the config.")
+
+        self.forward(data)
+
+        if self.latest_dift_sim_map is None:
+            raise RuntimeError("DIFT similarity map was not computed. Check that DIFT features are available.")
+
+        return self.latest_dift_sim_map
 
 
 

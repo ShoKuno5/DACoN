@@ -1,0 +1,45 @@
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+
+# IDE/project files
+.idea/
+.vscode/
+
+# Checkpoints / weights / datasets / outputs
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.ckpt
+*.bin
+*.safetensors
+dataset
+dataset/
+datasets/
+dacon/dataset
+dacon/dataset/
+outputs
+outputs/
+dacon/outputs
+dacon/outputs/
+
+# Generated caches
+dacon/__pycache__/
+dacon/data/__pycache__/
+dacon/models/__pycache__/
+dacon/utils/__pycache__/
+dacon/losses/__pycache__/
+dacon/tests/__pycache__/

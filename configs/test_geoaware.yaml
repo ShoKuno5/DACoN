@@ -1,0 +1,61 @@
+
+name: dacon_test_geoaware
+model_type: DACoN
+
+num_gpu: 1 
+manual_seed: 42
+
+version: "1_1"
+colorize_type: keyframe
+ref_shot: 1
+
+datasets:
+  name: PaintBucket_Char_v2
+  clip_interval: 20
+
+  val:
+    root: dataset/PaintBucket_Char_v2/test_small/PaintBucket_Char_v2/
+    save_path: outputs/
+    num_worker: 4
+
+network:
+  feats_dim: 128
+  feature_backbone_only: true
+
+  feature_backbone:
+    type: geoaware
+    repo_path: ../GeoAware-SC
+    device: cuda
+    num_patches: 60
+    sd_diffusion_ver: v1-5
+    sd_image_size: 960
+    sd_num_timesteps: 50
+    geo_dino_model: dinov2_vitb14
+    geo_dino_stride: 14
+    geo_dino_layer: 11
+    aggregation_feature_dims: [640, 1280, 1280, 768]
+    aggregation_output_dim: 768
+    pretrained_weights: ../GeoAware-SC/results_spair/best_856.PTH
+
+  dino_model_type: dinov2_vitl14
+  dino_input_size: [518, 518]
+
+  unet_input_size: [512, 512]
+  unet_input_dim: 3
+  unet_hidden_dim_list: [64, 128, 256, 512]
+
+  segment_pool_size: [512, 512]
+  
+  dift:
+    enabled: false
+
+val:
+  save_images: True
+  save_json: True
+  save_path: outputs/geoaware/
+
+  batch_size: 1
+
+losses:
+  loss_scale_ce: 0.5
+  loss_scale_mae: 0.2

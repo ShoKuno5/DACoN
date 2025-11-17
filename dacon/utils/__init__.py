@@ -1,10 +1,33 @@
+import logging
+import os
+from pathlib import Path
+
 from .image_process import *
 from .data_process import *
 from .metrics import *
 from .pooling import *
 
 import yaml
-import logging
+
+# Allow GeoAware-SC's `utils` directory to be discovered under the same package
+_geo_candidates = []
+_base_path = Path(__file__).resolve()
+for parent_offset in (2, 3, 4):
+    try:
+        candidate = _base_path.parents[parent_offset] / "GeoAware-SC" / "utils"
+    except IndexError:
+        continue
+    _geo_candidates.append(candidate)
+
+geo_env = os.environ.get("GEOAWARE_REPO")
+if geo_env:
+    _geo_candidates.insert(0, Path(geo_env).expanduser().resolve() / "utils")
+
+for _geo_utils_dir in _geo_candidates:
+    if _geo_utils_dir.is_dir():
+        _geo_utils_str = str(_geo_utils_dir)
+        if _geo_utils_str not in __path__:
+            __path__.append(_geo_utils_str)
 
 def format_time(seconds):
     m, s = divmod(seconds, 60)
